@@ -25,6 +25,11 @@ const sellerChannel = require("./lib/sellerChannel.js");
 const extensionBridge = require("./lib/extensionBridge.js");
 const imessage = require("./lib/imessage.js");
 const repostScheduler = require("./lib/repostScheduler.js");
+const craigslistDraft = require("./lib/craigslistDraft.js");
+const sellerInbox = require("./lib/sellerInbox.js");
+const llm = require("./lib/llm.js");
+const { filterByQuery } = require("./lib/textMatch.js");
+const { alternatesFor } = require("./lib/queryExpand.js");
 const { findRepostCandidates } = repostScheduler;
 const { isConfigured: telegramConfigured } = require("./lib/telegramNotifier.js");
 
@@ -43,7 +48,12 @@ const CRAIGSLIST_LOCATION = process.env.CRAIGSLIST_LOCATION || "sfbay";
 // interactive single-listing case so one slow listing can't stall a whole
 // search response.
 const SEARCH_PAGE_SIZE = 20;
-const SEARCH_MAX_PAGE_SIZE = 30;
+const SEARCH_MAX_PAGE_SIZE = 100;
+// Within one page, only this many listings get eager photo/detail
+// enrichment (one Craigslist request each) — the rest return with the
+// static-search fields and a placeholder image, keeping a 60-100 item
+// page from taking a minute and hammering Craigslist.
+const PHOTO_EAGER_ENRICH_LIMIT = 24;
 // Kept deliberately modest, with jitter (see PHOTO_ENRICH_JITTER_MS below):
 // this app got a real 403 from Craigslist mid-development after a burst of
 // automated testing, and a handful of requests firing in the exact same
@@ -76,7 +86,12 @@ const MAX_DATE_SORT_WINDOW = 120;
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// CORS on listing photos: the Ampy extension fetches them from inside a
+// craigslist.org page to attach to Craigslist's image uploader. Local
+// demo photos, world-readable by design.
+app.use("/uploads", express.static(path.join(__dirname, "uploads"), {
+  setHeaders: (res) => res.setHeader("Access-Control-Allow-Origin", "*"),
+}));
 
 // --- Page routes -----------------------------------------------------------
 
@@ -175,6 +190,7 @@ async function gatherListings({ q = "", category = "", location, maxPrice, maxDi
   let source = "mock";
   let craigslistWarning;
 
+  let effectiveQuery = q;
   if (!USE_MOCK_DATA) {
     const result = await searchCraigslist({
       query: q,
@@ -185,7 +201,28 @@ async function gatherListings({ q = "", category = "", location, maxPrice, maxDi
     if (result.listings.length > 0) {
       listings = result.listings;
       source = "craigslist";
-    } else {
+    } else if (q) {
+      // Zero results is often the query's fault, not the market's —
+      // non-US product names, over-specific phrasing, a year token nobody
+      // types. Retry with rewritten queries (Mistral first, mechanical
+      // relaxation as backup) before giving up. See lib/queryExpand.js.
+      for (const alternate of await alternatesFor(q)) {
+        const retry = await searchCraigslist({
+          query: alternate,
+          location: craigslistLocation,
+          category,
+          maxPrice: maxPrice ? Number(maxPrice) : undefined,
+        });
+        if (retry.listings.length > 0) {
+          listings = retry.listings;
+          source = "craigslist";
+          effectiveQuery = alternate;
+          console.log(`[server] craigslist: "${q}" found nothing; matched via rewritten query "${alternate}"`);
+          break;
+        }
+      }
+    }
+    if (listings.length === 0) {
       // Live fetch failed or returned nothing — fall back to mock/demo data
       // rather than showing the buyer an empty page.
       craigslistWarning = result.error || "no live results";
@@ -205,12 +242,14 @@ async function gatherListings({ q = "", category = "", location, maxPrice, maxDi
   listings = [...listings, ...sellerListings];
 
   if (q) {
-    const needle = q.toLowerCase();
-    listings = listings.filter(
-      (l) =>
-        l.title.toLowerCase().includes(needle) ||
-        (l.description || "").toLowerCase().includes(needle)
-    );
+    // Live Craigslist rows already matched the (possibly rewritten) query
+    // on Craigslist's side — keep them all; the token filter only gates
+    // mock/seller listings. Everything kept gains a `_textScore` that
+    // lib/rank.js blends into relevance ordering.
+    const liveCraigslist = source === "craigslist";
+    listings = filterByQuery(listings, effectiveQuery, {
+      isTrusted: (l) => liveCraigslist && l.source !== "seller",
+    });
   }
   if (category) {
     listings = listings.filter((l) => l.category === category);
@@ -226,7 +265,7 @@ async function gatherListings({ q = "", category = "", location, maxPrice, maxDi
 
   indexListings(listings);
 
-  return { listings, source, craigslistWarning };
+  return { listings, source, craigslistWarning, effectiveQuery: effectiveQuery !== q ? effectiveQuery : undefined };
 }
 
 app.get("/api/search", async (req, res) => {
@@ -234,7 +273,7 @@ app.get("/api/search", async (req, res) => {
   const pageSize = Math.min(SEARCH_MAX_PAGE_SIZE, Number(limit) || SEARCH_PAGE_SIZE);
   const pageOffset = Math.max(0, Number(offset) || 0);
 
-  const { listings, source, craigslistWarning } = await gatherListings({
+  const { listings, source, craigslistWarning, effectiveQuery } = await gatherListings({
     q,
     category,
     location,
@@ -272,12 +311,17 @@ app.get("/api/search", async (req, res) => {
     // page, bounded and concurrency-limited — see the constants above.
     // Non-craigslist listings pass through untouched (mock/seller listings
     // already carry whatever imageUrl they have, or none).
-    page = await mapWithConcurrency(
-      pageListings,
-      PHOTO_ENRICH_CONCURRENCY,
-      (listing) => enrichCraigslistListing(listing, { timeoutMs: PHOTO_ENRICH_TIMEOUT_MS }),
-      { jitterMs: PHOTO_ENRICH_JITTER_MS }
-    );
+    const eager = pageListings.slice(0, PHOTO_EAGER_ENRICH_LIMIT);
+    const rest = pageListings.slice(PHOTO_EAGER_ENRICH_LIMIT);
+    page = [
+      ...(await mapWithConcurrency(
+        eager,
+        PHOTO_ENRICH_CONCURRENCY,
+        (listing) => enrichCraigslistListing(listing, { timeoutMs: PHOTO_ENRICH_TIMEOUT_MS }),
+        { jitterMs: PHOTO_ENRICH_JITTER_MS }
+      )),
+      ...rest,
+    ];
     hasMore = windowEnd < totalMatches;
   }
 
@@ -290,6 +334,7 @@ app.get("/api/search", async (req, res) => {
     sort: sort || "relevance",
     source,
     usedMockData: source === "mock",
+    ...(effectiveQuery ? { effectiveQuery } : {}),
     ...(craigslistWarning ? { craigslistWarning } : {}),
   });
 });
@@ -426,7 +471,7 @@ fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 const SELLER_STYLES = ["balanced", "firm", "flexible"];
 
-app.post("/api/listings", upload.single("photo"), (req, res) => {
+app.post("/api/listings", upload.fields([{ name: "photos", maxCount: 8 }, { name: "photo", maxCount: 1 }]), (req, res) => {
   const body = req.body || {};
   if (!body.title || !body.price) {
     return res.status(400).json({ error: "title and price are required" });
@@ -450,15 +495,21 @@ app.post("/api/listings", upload.single("photo"), (req, res) => {
     return res.status(400).json({ error: `negotiationStyle must be one of: ${SELLER_STYLES.join(", ")}` });
   }
 
-  let imageUrl = body.imageUrl || null;
-  if (req.file) {
-    const filename = `${Date.now()}-${req.file.originalname.replace(/[^a-z0-9.\-_]/gi, "_")}`;
-    fs.writeFileSync(path.join(UPLOADS_DIR, filename), req.file.buffer);
-    imageUrl = `/uploads/${filename}`;
-  }
+  // Multiple photos ("photos"), with the old single "photo" field still
+  // accepted. First saved photo is the cover (imageUrl); all of them ride
+  // along on `images` and into the Craigslist draft.
+  const files = [...(req.files?.photos || []), ...(req.files?.photo || [])];
+  const images = files.map((file, index) => {
+    const filename = `${Date.now()}-${index}-${file.originalname.replace(/[^a-z0-9.\-_]/gi, "_")}`;
+    fs.writeFileSync(path.join(UPLOADS_DIR, filename), file.buffer);
+    return `/uploads/${filename}`;
+  });
+  const imageUrl = images[0] || body.imageUrl || null;
 
   const listing = listingStore.createListing({
     title: body.title,
+    craigslistLocation: body.craigslistLocation,
+    postal: body.postal,
     category: body.category,
     price: body.price,
     condition: body.condition,
@@ -466,13 +517,37 @@ app.post("/api/listings", upload.single("photo"), (req, res) => {
     location: body.location,
     sellerName: body.sellerName,
     imageUrl,
+    images,
     minAcceptablePrice,
     negotiationStyle: body.negotiationStyle,
     detectedFrom: body.detectedFrom ? JSON.parse(body.detectedFrom) : null,
   });
 
   recentListingsById.set(listing.id, listing);
-  res.status(201).json(listing);
+  // Craigslist cross-post draft — not persisted (fully derivable from the
+  // listing); the UI shows it once with a link to Craigslist's posting flow.
+  const craigslist = craigslistDraft.buildDraft(listing);
+  // If the Ampy extension is connected, hand it the draft right away so a
+  // pre-filled Craigslist posting tab opens in the user's own browser the
+  // moment they publish. The user still reviews and clicks publish there.
+  let craigslistAutoQueued = false;
+  if (extensionBridge.isConnected()) {
+    extensionBridge.queueCraigslistPost(craigslist);
+    craigslistAutoQueued = true;
+  }
+  res.status(201).json({ ...listing, craigslist, craigslistAutoQueued });
+});
+
+// Queue a "fill the Craigslist posting form in the user's own browser"
+// job for the Ampy Chrome extension. Ampy never posts to Craigslist
+// itself (no API; automation is against their terms) — the extension
+// pre-fills the form in the user's session and the user clicks publish.
+app.post("/api/listings/:id/post-to-craigslist", (req, res) => {
+  const listing = listingStore.getById(req.params.id);
+  if (!listing) return res.status(404).json({ error: "listing not found" });
+  const draft = craigslistDraft.buildDraft(listing);
+  const result = extensionBridge.queueCraigslistPost(draft);
+  res.json({ ...result, draft });
 });
 
 // --- Buyer agent -----------------------------------------------------------
@@ -650,6 +725,73 @@ app.get("/api/extension/status", allowExtension, (req, res) => {
   res.json(extensionBridge.status());
 });
 
+// --- Seller iMessage inbox -------------------------------------------------
+//
+// The seller agent answering real humans who text about a listing —
+// lib/sellerInbox.js. Status shows threads and any deals waiting for the
+// human's confirmation; /scan forces a poll; /simulate runs the full
+// match->reply pipeline for a hypothetical message without sending.
+app.get("/api/seller-inbox/status", (req, res) => {
+  res.json(sellerInbox.status());
+});
+app.post("/api/seller-inbox/scan", async (req, res) => {
+  res.json(await sellerInbox.scanOnce({ force: true }));
+});
+app.post("/api/seller-inbox/simulate", async (req, res) => {
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ error: "text is required" });
+  try {
+    res.json(await sellerInbox.simulate({ handle: String(req.body?.handle || "sim-buyer"), text }));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Debug telemetry from the extension: what it saw and filled on each
+// Craigslist page load. Log-only — makes "nothing happened" diagnosable.
+app.post("/api/extension/fill-report", allowExtension, (req, res) => {
+  const { url, note, filled, error } = req.body || {};
+  console.log(`[extension fill] ${String(note || "")} url=${String(url || "").slice(0, 120)} filled=${JSON.stringify(filled || [])}${error ? ` error=${String(error).slice(0, 200)}` : ""}`);
+  res.json({ ok: true });
+});
+
+// The extension found a Craigslist sub-area chooser ("peninsula", "east
+// bay", ...) and sends the page's actual options plus the listing's ZIP.
+// Mistral picks the option that contains that ZIP — generic across every
+// metro, no hardcoded geography. Returns {choice: null} when unsure, in
+// which case nothing is pre-selected and the seller picks by hand.
+const subAreaCache = new Map();
+app.post("/api/extension/resolve-subarea", allowExtension, async (req, res) => {
+  const { postal, location, options } = req.body || {};
+  const zip = String(postal || "").trim();
+  const list = Array.isArray(options) ? options.map((o) => String(o).trim()).filter(Boolean).slice(0, 30) : [];
+  if (!/^\d{5}(-\d{4})?$/.test(zip) || list.length < 2) {
+    return res.json({ choice: null });
+  }
+  const key = `${zip}|${location || ""}|${list.join("~")}`;
+  if (subAreaCache.has(key)) return res.json({ choice: subAreaCache.get(key) });
+  let choice = null;
+  try {
+    const out = await llm.chatJSON({
+      maxTokens: 128,
+      schema: { type: "object", properties: { choice: { type: "string" } }, required: ["choice"] },
+      system:
+        "You map a US ZIP code to the Craigslist sub-area that geographically contains it. " +
+        "Reply with exactly one string copied verbatim from the provided options — the one whose " +
+        "area contains (or is nearest to) the ZIP. If you are not confident, reply with the string " +
+        '"unknown". Never invent an option.',
+      user: JSON.stringify({ zip, metro: location || "unknown metro", options: list }),
+    });
+    const answer = String(out.choice || "").trim();
+    choice = list.find((option) => option.toLowerCase() === answer.toLowerCase()) || null;
+  } catch {
+    choice = null; // no key / rate limit — seller picks by hand
+  }
+  if (subAreaCache.size > 500) subAreaCache.delete(subAreaCache.keys().next().value);
+  subAreaCache.set(key, choice);
+  res.json({ choice });
+});
+
 // Long-poll: held open until there's a job or the hold window expires.
 app.get("/api/extension/jobs", allowExtension, async (req, res) => {
   const jobs = await extensionBridge.pollForJobs();
@@ -657,8 +799,9 @@ app.get("/api/extension/jobs", allowExtension, async (req, res) => {
 });
 
 app.post("/api/extension/jobs/:id/results", allowExtension, (req, res) => {
-  const { listings, error } = req.body || {};
-  const result = extensionBridge.resolveJob(req.params.id, { listings, error });
+  // (posting jobs ack with {status}; search jobs deliver {listings})
+  const { listings, error, status } = req.body || {};
+  const result = extensionBridge.resolveJob(req.params.id, { listings, error, status });
   if (!result.ok) return res.status(404).json(result);
   res.json(result);
 });
@@ -713,4 +856,5 @@ app.listen(PORT, () => {
   // configured — see lib/repostScheduler.js.
   repostScheduler.startCallbackListener();
   repostScheduler.startWeeklySchedule();
+  sellerInbox.start();
 });

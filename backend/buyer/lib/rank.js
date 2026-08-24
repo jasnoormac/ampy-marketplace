@@ -17,7 +17,7 @@ function normalize(values) {
  * @param {object} [weights] - relative weights for price/distance/recency (lower price/distance is better; more recent is better)
  * @returns {object[]} listings sorted best-first, each with a `_score` (0-1, higher is better)
  */
-function rankListings(listings, weights = { price: 0.45, distance: 0.25, recency: 0.3 }) {
+function rankListings(listings, weights = { price: 0.3, distance: 0.15, recency: 0.2, text: 0.35 }) {
   const priceNorm = normalize(listings.map((l) => l.price));
   const distanceNorm = normalize(listings.map((l) => l.distanceMiles));
   const now = Date.now();
@@ -31,8 +31,15 @@ function rankListings(listings, weights = { price: 0.45, distance: 0.25, recency
     const age = listing.postedAt ? now - new Date(listing.postedAt).getTime() : null;
     const recencyScore = 1 - ageNorm(age); // newer = higher score
 
+    // _textScore comes from lib/textMatch.js when the search had a text
+    // query; 0.5 is neutral so unqueried browsing ranks as before.
+    const textScore = typeof listing._textScore === "number" ? listing._textScore : 0.5;
+
     const score =
-      weights.price * priceScore + weights.distance * distanceScore + weights.recency * recencyScore;
+      weights.price * priceScore +
+      weights.distance * distanceScore +
+      weights.recency * recencyScore +
+      (weights.text || 0) * textScore;
 
     return { ...listing, _score: Number(score.toFixed(4)) };
   });

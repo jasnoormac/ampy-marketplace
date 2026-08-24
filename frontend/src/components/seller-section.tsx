@@ -1,15 +1,17 @@
 "use client";
 
 import * as React from "react";
-import { BadgeCheck, ImagePlus, Loader2, Package, Store, UserRound, Wand2, X } from "lucide-react";
+import { BadgeCheck, Check, ClipboardCopy, ExternalLink, ImagePlus, Loader2, MapPin, Package, Store, UserRound, Wand2, X } from "lucide-react";
 
 import { formatUsd } from "@/lib/purchase";
+import { runRealMarketSale } from "@/lib/realMarket";
 import { MAX_QUANTITY, runMarketSimulation, type AgentStatus, type SimAgent, type SimState } from "@/lib/simulation";
-import { cn } from "@/lib/utils";
+import { cn, titleCaseLocation } from "@/lib/utils";
 
 const CONDITIONS = ["new", "like new", "excellent", "good", "fair"] as const;
 const CATEGORIES = ["electronics", "furniture", "vehicles", "appliances", "instruments", "sporting goods", "general"] as const;
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+const MAX_PHOTOS = 8;
 
 interface Draft {
   title: string;
@@ -21,14 +23,29 @@ interface Draft {
   quantity: string;
 }
 
+interface CraigslistDraft {
+  postUrl: string;
+  location: string;
+  locationName?: string;
+  category: string;
+  postingTitle: string;
+  price: number;
+  body: string;
+  draftText: string;
+}
+
 interface PublishedListing {
   id: string;
   title: string;
+  description: string;
   imageUrl: string | null;
   listPrice: number;
   floorPrice: number;
   quantity: number;
   marketplace: boolean;
+  realAgents: boolean;
+  craigslist?: CraigslistDraft | null;
+  craigslistAutoQueued?: boolean;
 }
 
 const EMPTY_DRAFT: Draft = { title: "", description: "", condition: "good", category: "general", upper: "", lower: "", quantity: "1" };
@@ -41,9 +58,37 @@ const inputClass = "h-10 w-full rounded-xl border border-white/10 bg-black/30 px
  */
 export function SellerSection(): React.ReactElement {
   const [draft, setDraft] = React.useState<Draft>(EMPTY_DRAFT);
-  const [photo, setPhoto] = React.useState<File | null>(null);
-  const [photoPreview, setPhotoPreview] = React.useState<string | null>(null);
+  const [photos, setPhotos] = React.useState<File[]>([]);
+  const [photoPreviews, setPhotoPreviews] = React.useState<string[]>([]);
   const [detecting, setDetecting] = React.useState(false);
+  const [realAgents, setRealAgents] = React.useState(true);
+  const [sellLocation, setSellLocation] = React.useState("");
+  const [postal, setPostal] = React.useState("");
+  const [sellLocations, setSellLocations] = React.useState<{ slug: string; name: string; state: string }[]>([]);
+
+  // Craigslist market list + server default, same source as the buyer tab.
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch("/api/craigslist-locations")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data: { locations?: { region: string; slug: string; name: string; state: string }[]; default?: string } | null) => {
+        if (cancelled || !data) return;
+        setSellLocations((data.locations || []).filter((item) => item.region === "US" && item.slug && item.state));
+        if (data.default) setSellLocation((prev) => prev || data.default!);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const sellLocationsByState = React.useMemo(() => {
+    const groups = new Map<string, { slug: string; name: string; state: string }[]>();
+    for (const item of sellLocations) {
+      const group = groups.get(item.state) ?? [];
+      group.push(item);
+      groups.set(item.state, group);
+    }
+    return Array.from(groups.entries());
+  }, [sellLocations]);
   const [publishing, setPublishing] = React.useState(false);
   const [formError, setFormError] = React.useState<string | null>(null);
   const [formNote, setFormNote] = React.useState<string | null>(null);
@@ -58,24 +103,37 @@ export function SellerSection(): React.ReactElement {
   const canPublish = draft.title.trim().length > 0 && boundsValid && quantityValid && !publishing;
   const setField = (key: keyof Draft) => (value: string) => setDraft((prev) => ({ ...prev, [key]: value }));
 
-  const choosePhoto = (file: File | null) => {
-    if (!file) return;
-    if (!file.type.startsWith("image/")) return setFormError("Only image files are supported.");
-    if (file.size > MAX_PHOTO_BYTES) return setFormError("The photo is larger than 8 MB.");
-    setFormError(null);
-    setPhoto(file);
-    const reader = new FileReader();
-    reader.onload = () => setPhotoPreview(typeof reader.result === "string" ? reader.result : null);
-    reader.readAsDataURL(file);
+  const addPhotos = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const incoming = Array.from(files);
+    if (incoming.some((file) => !file.type.startsWith("image/"))) return setFormError("Only image files are supported.");
+    if (incoming.some((file) => file.size > MAX_PHOTO_BYTES)) return setFormError("Each photo must be 8 MB or less.");
+    const room = MAX_PHOTOS - photos.length;
+    if (room <= 0) return setFormError(`Up to ${MAX_PHOTOS} photos per listing.`);
+    const accepted = incoming.slice(0, room);
+    setFormError(incoming.length > room ? `Only ${MAX_PHOTOS} photos fit — kept the first ${room} of this batch.` : null);
+    setPhotos((prev) => [...prev, ...accepted]);
+    for (const file of accepted) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string") setPhotoPreviews((prev) => [...prev, reader.result as string]);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const removePhoto = (index: number) => {
+    setPhotos((prev) => prev.filter((_, i) => i !== index));
+    setPhotoPreviews((prev) => prev.filter((_, i) => i !== index));
   };
 
   const autofill = async () => {
-    if (!photo) return;
+    if (!photos.length) return;
     setDetecting(true);
     setFormError(null);
     try {
       const body = new FormData();
-      body.append("photos", photo);
+      for (const file of photos.slice(0, 6)) body.append("photos", file);
       const response = await fetch("/api/vision-detect", { method: "POST", body, signal: AbortSignal.timeout(60_000) });
       const payload = await response.json().catch(() => ({})) as { draft?: Record<string, unknown>; error?: string; detail?: string };
       if (!response.ok || !payload.draft) throw new Error(payload.detail || payload.error || "Could not read the photo.");
@@ -107,7 +165,7 @@ export function SellerSection(): React.ReactElement {
     }
     setPublishing(true);
     setFormError(null);
-    let published: PublishedListing = { id: `local-${Math.random().toString(36).slice(2, 8)}`, title: draft.title.trim(), imageUrl: photoPreview, listPrice: upper, floorPrice: lower, quantity, marketplace: false };
+    let published: PublishedListing = { id: `local-${Math.random().toString(36).slice(2, 8)}`, title: draft.title.trim(), description: draft.description.trim(), imageUrl: photoPreviews[0] ?? null, listPrice: upper, floorPrice: lower, quantity, marketplace: false, realAgents };
     try {
       const body = new FormData();
       body.append("title", published.title);
@@ -117,11 +175,13 @@ export function SellerSection(): React.ReactElement {
       body.append("category", draft.category);
       body.append("description", draft.description.trim());
       body.append("negotiationStyle", "balanced");
-      if (photo) body.append("photo", photo);
+      if (sellLocation) body.append("craigslistLocation", sellLocation);
+      if (postal.trim()) body.append("postal", postal.trim());
+      for (const file of photos) body.append("photos", file);
       const response = await fetch("/api/listings", { method: "POST", body, signal: AbortSignal.timeout(20_000) });
       if (response.ok) {
-        const saved = await response.json() as { id?: string; imageUrl?: string | null };
-        published = { ...published, id: typeof saved.id === "string" ? saved.id : published.id, imageUrl: typeof saved.imageUrl === "string" ? saved.imageUrl : photoPreview, marketplace: true };
+        const saved = await response.json() as { id?: string; imageUrl?: string | null; craigslist?: CraigslistDraft | null; craigslistAutoQueued?: boolean };
+        published = { ...published, id: typeof saved.id === "string" ? saved.id : published.id, imageUrl: typeof saved.imageUrl === "string" ? saved.imageUrl : (photoPreviews[0] ?? null), marketplace: true, craigslist: saved.craigslist ?? null, craigslistAutoQueued: saved.craigslistAutoQueued === true };
       }
     } catch {
       // marketplace backend offline — simulate locally
@@ -133,8 +193,8 @@ export function SellerSection(): React.ReactElement {
   const reset = () => {
     setListing(null);
     setDraft(EMPTY_DRAFT);
-    setPhoto(null);
-    setPhotoPreview(null);
+    setPhotos([]);
+    setPhotoPreviews([]);
     setFormNote(null);
     setFormError(null);
   };
@@ -149,26 +209,42 @@ export function SellerSection(): React.ReactElement {
       </header>
 
       {listing ? (
-        <MarketSimulation key={listing.id} listing={listing} onReset={reset} />
+        <>
+          {listing.craigslist ? <CraigslistCard listing={listing} draft={listing.craigslist} /> : null}
+          <MarketSimulation key={listing.id} listing={listing} onReset={reset} />
+        </>
       ) : (
         <form onSubmit={publish} className="mx-auto flex w-full max-w-[720px] flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-5" aria-label="Listing details">
           <div className="flex items-start gap-3">
-            <button type="button" onClick={() => photoInputRef.current?.click()} className="flex size-28 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-dashed border-white/20 bg-black/20 text-white/40 hover:border-violet-400/50 hover:text-white" aria-label={photoPreview ? "Change photo" : "Upload photo"}>
-              {photoPreview ? (
+            <button type="button" onClick={() => photoInputRef.current?.click()} className="flex size-28 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-dashed border-white/20 bg-black/20 text-white/40 hover:border-violet-400/50 hover:text-white" aria-label={photoPreviews.length ? "Add more photos" : "Upload photos"}>
+              {photoPreviews[0] ? (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={photoPreview} alt="" className="h-full w-full object-cover" />
+                <img src={photoPreviews[0]} alt="" className="h-full w-full object-cover" />
               ) : <ImagePlus className="size-7" />}
             </button>
-            <input ref={photoInputRef} type="file" accept="image/*" className="hidden" aria-label="Photo file" onChange={(event) => { choosePhoto(event.target.files?.item(0) ?? null); event.target.value = ""; }} />
-            <div className="flex flex-col gap-2 text-xs text-white/50">
-              <p>{photo ? photo.name : "Photo — JPG or PNG, up to 8 MB."}</p>
+            <input ref={photoInputRef} type="file" accept="image/*" multiple className="hidden" aria-label="Photo files" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} />
+            <div className="flex min-w-0 flex-1 flex-col gap-2 text-xs text-white/50">
+              <p>{photos.length ? `${photos.length} photo${photos.length === 1 ? "" : "s"} — the first is the cover, all go to Craigslist.` : `Photos — JPG or PNG, up to 8 MB each, max ${MAX_PHOTOS}.`}</p>
               <div className="flex flex-wrap gap-2">
-                <button type="button" onClick={autofill} disabled={!photo || detecting} className="inline-flex h-8 items-center gap-1.5 rounded-full bg-violet-500/20 px-3 text-xs font-medium text-violet-200 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-50">
+                <button type="button" onClick={autofill} disabled={!photos.length || detecting} className="inline-flex h-8 items-center gap-1.5 rounded-full bg-violet-500/20 px-3 text-xs font-medium text-violet-200 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-50">
                   {detecting ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-                  {detecting ? "Reading photo…" : "Auto-fill from photo"}
+                  {detecting ? "Reading photos…" : "Auto-fill from photos"}
                 </button>
-                {photo ? <button type="button" onClick={() => { setPhoto(null); setPhotoPreview(null); }} className="inline-flex h-8 items-center gap-1 rounded-full border border-white/15 px-3 text-xs text-white/60 hover:bg-white/5"><X className="size-3" /> Remove</button> : null}
+                <button type="button" onClick={() => photoInputRef.current?.click()} className="inline-flex h-8 items-center gap-1 rounded-full border border-white/15 px-3 text-xs text-white/60 hover:bg-white/5"><ImagePlus className="size-3" /> Add photos</button>
               </div>
+              {photoPreviews.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {photoPreviews.map((preview, index) => (
+                    <div key={`${index}-${preview.slice(-16)}`} className="group relative size-14 overflow-hidden rounded-lg border border-white/10">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={preview} alt={`Photo ${index + 1}`} className="h-full w-full object-cover" />
+                      <button type="button" onClick={() => removePhoto(index)} aria-label={`Remove photo ${index + 1}`} className="absolute right-0.5 top-0.5 hidden rounded-full bg-black/70 p-0.5 text-white group-hover:block">
+                        <X className="size-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </div>
           <Field label="Title"><input value={draft.title} onChange={(event) => setField("title")(event.target.value)} placeholder="e.g. Sony WH-1000XM5 headphones, boxed" className={inputClass} /></Field>
@@ -176,6 +252,22 @@ export function SellerSection(): React.ReactElement {
           <div className="grid grid-cols-2 gap-3">
             <Field label="Condition"><select value={draft.condition} onChange={(event) => setField("condition")(event.target.value)} className={inputClass}>{CONDITIONS.map((value) => <option key={value} value={value}>{value}</option>)}</select></Field>
             <Field label="Category"><select value={draft.category} onChange={(event) => setField("category")(event.target.value)} className={inputClass}>{CATEGORIES.map((value) => <option key={value} value={value}>{value}</option>)}</select></Field>
+          </div>
+          <div className="grid grid-cols-[1.6fr_0.9fr] gap-3">
+            <Field label="Selling from · Craigslist market">
+              <div className="flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3">
+                <MapPin className="size-3.5 shrink-0 text-violet-300" />
+                <select value={sellLocation} onChange={(event) => setSellLocation(event.target.value)} className="w-full bg-transparent text-sm text-white outline-none">
+                  {sellLocations.length === 0 ? <option value="" className="bg-[#141418]">loading markets…</option> : null}
+                  {sellLocationsByState.map(([state, markets]) => (
+                    <optgroup key={state} label={state} className="bg-[#141418]">
+                      {markets.map((item) => <option key={item.slug} value={item.slug} className="bg-[#141418]">{titleCaseLocation(item.name)}</option>)}
+                    </optgroup>
+                  ))}
+                </select>
+              </div>
+            </Field>
+            <Field label="ZIP code · for Craigslist"><input value={postal} onChange={(event) => setPostal(event.target.value.replace(/[^0-9-]/g, "").slice(0, 10))} inputMode="numeric" placeholder="e.g. 94103" className={inputClass} /></Field>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <Field label="Upper bound · asking price (USD)"><input type="number" min={1} step="1" inputMode="decimal" value={draft.upper} onChange={(event) => setField("upper")(event.target.value)} placeholder="e.g. 250" className={inputClass} /></Field>
@@ -186,6 +278,10 @@ export function SellerSection(): React.ReactElement {
             <Field label="Quantity in inventory (1–100)"><input type="number" min={1} max={MAX_QUANTITY} step="1" inputMode="numeric" value={draft.quantity} onChange={(event) => setField("quantity")(event.target.value)} className={inputClass} /></Field>
             <p className="pb-2.5 text-xs text-white/45">{quantityValid ? `Buyer agents keep negotiating until all ${quantity} ${quantity === 1 ? "unit is" : "units are"} sold.` : `Enter 1 to ${MAX_QUANTITY} units.`}</p>
           </div>
+          <label className="flex items-center gap-2 text-xs text-white/55">
+            <input type="checkbox" checked={realAgents} onChange={(event) => setRealAgents(event.target.checked)} className="size-3.5 accent-violet-500" />
+            Real agents — buyer offers come from Mistral and your seller agent answers with your actual bounds (slower, uses API credits). Off = instant scripted demo.
+          </label>
           {formNote ? <p className="text-xs text-violet-200/80">{formNote}</p> : null}
           {formError ? <p role="alert" className="text-xs text-red-300">{formError}</p> : null}
           <button type="submit" disabled={!canPublish} className="inline-flex h-11 items-center justify-center gap-2 rounded-full bg-violet-500 px-5 text-sm font-medium text-white hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-50">
@@ -202,20 +298,124 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return <label className="flex flex-col gap-1 text-xs text-white/55">{label}{children}</label>;
 }
 
+/**
+ * Craigslist has no posting API, so cross-posting is seller-driven: Ampy
+ * preps the draft, the seller pastes it into Craigslist's own posting flow
+ * (their session, their final click) via the link here.
+ */
+function CraigslistCard({ listing, draft }: { listing: PublishedListing; draft: CraigslistDraft }): React.ReactElement {
+  const [copied, setCopied] = React.useState(false);
+  const [assistNote, setAssistNote] = React.useState<string | null>(
+    listing.craigslistAutoQueued
+      ? "Sent to your Chrome — a Craigslist tab opened with the posting pre-filled. Review each step there and click publish yourself."
+      : null,
+  );
+  const [assistBusy, setAssistBusy] = React.useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(draft.draftText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard unavailable (permissions / non-secure context) — the
+      // draft is still visible below for manual selection.
+    }
+  };
+
+  const autofillInChrome = async (): Promise<boolean> => {
+    setAssistBusy(true);
+    try {
+      const response = await fetch(`/api/listings/${encodeURIComponent(listing.id)}/post-to-craigslist`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { queued?: boolean; extensionConnected?: boolean; error?: string };
+      if (!response.ok) throw new Error(payload.error || "Could not queue the posting job.");
+      setAssistNote(payload.extensionConnected
+        ? "Sent to your Chrome — a Craigslist tab opened with the posting pre-filled. Review each step there and click publish yourself."
+        : "The Ampy extension isn't connected. Load it once: chrome://extensions → Developer mode → Load unpacked → select the ampy-extension folder in Downloads — then click this again.");
+      return payload.extensionConnected === true;
+    } catch (error: unknown) {
+      setAssistNote(error instanceof Error ? error.message : "Could not reach the marketplace backend.");
+      return false;
+    } finally {
+      setAssistBusy(false);
+    }
+  };
+
+  // "Open Craigslist" routes through the extension when possible, so the
+  // tab that opens is pre-filled; otherwise it's a plain new tab.
+  const openCraigslist = async () => {
+    const viaExtension = listing.marketplace ? await autofillInChrome() : false;
+    if (!viaExtension) window.open(draft.postUrl, "_blank", "noopener,noreferrer");
+  };
+
+  return (
+    <aside className="mx-auto w-full max-w-[720px] rounded-3xl border border-white/10 bg-white/5 p-5" aria-label="Cross-post to Craigslist">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Cross-post to Craigslist</h3>
+          <p className="mt-1 text-xs text-white/50">
+            Craigslist doesn&apos;t allow automated posting, so the final publish click is always yours — Ampy preps the draft and, with the extension, pre-fills the form in your own Chrome ({draft.locationName ?? draft.location}, “{draft.category}”).
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {listing.marketplace ? (
+            <button type="button" onClick={autofillInChrome} disabled={assistBusy} className="inline-flex h-9 items-center gap-1.5 rounded-full bg-emerald-500/90 px-4 text-xs font-medium text-white hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50">
+              {assistBusy ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />} Auto-fill in Chrome
+            </button>
+          ) : null}
+          <button type="button" onClick={copy} className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/15 px-4 text-xs font-medium text-white/80 hover:bg-white/10">
+            {copied ? <Check className="size-3.5 text-emerald-300" /> : <ClipboardCopy className="size-3.5" />}
+            {copied ? "Copied" : "Copy draft"}
+          </button>
+          <button type="button" onClick={openCraigslist} disabled={assistBusy} className="inline-flex h-9 items-center gap-1.5 rounded-full bg-violet-500 px-4 text-xs font-medium text-white hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-50">
+            <ExternalLink className="size-3.5" /> Open Craigslist
+          </button>
+        </div>
+      </div>
+      {assistNote ? <p className="mt-3 text-xs text-emerald-200/80">{assistNote}</p> : null}
+      <pre className="mt-4 max-h-40 overflow-auto whitespace-pre-wrap rounded-2xl border border-white/10 bg-black/30 p-3 text-xs leading-5 text-white/70">{draft.draftText}</pre>
+    </aside>
+  );
+}
+
 function MarketSimulation({ listing, onReset }: { listing: PublishedListing; onReset: () => void }): React.ReactElement {
   const [state, setState] = React.useState<SimState | null>(null);
+  const [mode, setMode] = React.useState<"real" | "sim">(listing.realAgents ? "real" : "sim");
 
   React.useEffect(() => {
     const controller = new AbortController();
     setState(null);
-    runMarketSimulation({
-      itemName: listing.title,
-      listPrice: listing.listPrice,
-      floorPrice: listing.floorPrice,
-      quantity: listing.quantity,
-      signal: controller.signal,
-      onUpdate: setState,
-    }).catch(() => undefined);
+    const runScripted = () =>
+      runMarketSimulation({
+        itemName: listing.title,
+        listPrice: listing.listPrice,
+        floorPrice: listing.floorPrice,
+        quantity: listing.quantity,
+        signal: controller.signal,
+        onUpdate: setState,
+      }).catch(() => undefined);
+    if (listing.realAgents) {
+      setMode("real");
+      runRealMarketSale({
+        itemName: listing.title,
+        description: listing.description,
+        listPrice: listing.listPrice,
+        floorPrice: listing.floorPrice,
+        quantity: listing.quantity,
+        signal: controller.signal,
+        onUpdate: setState,
+      }).catch(() => {
+        // Real agents unreachable (missing key, backend down) — fall back
+        // to the scripted demo rather than a dead screen.
+        if (controller.signal.aborted) return;
+        setMode("sim");
+        setState(null);
+        void runScripted();
+      });
+    } else {
+      setMode("sim");
+      void runScripted();
+    }
     return () => controller.abort();
   }, [listing]);
 
@@ -238,7 +438,12 @@ function MarketSimulation({ listing, onReset }: { listing: PublishedListing; onR
           ) : <div className="flex h-full w-full items-center justify-center text-white/30"><Store className="size-5" /></div>}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold">{listing.title}</p>
+          <p className="flex items-center gap-2 truncate text-sm font-semibold">
+            {listing.title}
+            <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.12em]", mode === "real" ? "bg-emerald-400/15 text-emerald-300" : "bg-white/10 text-white/50")}>
+              {mode === "real" ? "Real agents · Mistral" : "Scripted demo"}
+            </span>
+          </p>
           <p className="mt-0.5 text-xs text-white/45">
             Asking {formatUsd(listing.listPrice)} · floor {formatUsd(listing.floorPrice)} <span className="text-white/30">(hidden from buyers)</span> · <Package className="inline size-3.5 align-[-2px]" /> {remaining} of {listing.quantity} left{listing.marketplace ? " · listed in the Ampy marketplace" : " · local listing"}
           </p>

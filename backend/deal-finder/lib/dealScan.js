@@ -167,9 +167,8 @@ function cacheEventsFrom(parsed) {
 
 async function replayCached(send, startedAt, { fast = false } = {}) {
   const parsed = JSON.parse(await fs.readFile(LAST_SCAN_PATH, "utf8"));
-  if (parsed?.params && parsed.params.location !== "us") {
-    throw new Error("The last scan predates U.S. coverage; run a new nationwide scan first");
-  }
+  // Any location is replayable — the cache stores whatever the last scan
+  // searched, nationwide or a single market picked in the UI.
   let events = cacheEventsFrom(parsed);
 
   if (!events.length) throw new Error("No cached deal scan is available");

@@ -19,7 +19,14 @@ import {
   type TraceLine,
 } from "@/lib/dealFinder";
 import { ampyApi } from "@/lib/ampy";
-import { cn } from "@/lib/utils";
+import { cn, titleCaseLocation } from "@/lib/utils";
+
+interface CraigslistLocation {
+  region: string;
+  state: string;
+  slug: string;
+  name: string;
+}
 
 /**
  * Reseller = the Deal Finder. A port of deal-finder/public/app.js from the
@@ -195,6 +202,8 @@ export function ResellerSection(): React.ReactElement {
   const stateRef = React.useRef(state);
   stateRef.current = state;
   const [category, setCategory] = React.useState("general");
+  const [location, setLocation] = React.useState("us");
+  const [locations, setLocations] = React.useState<CraigslistLocation[]>([]);
   const [query, setQuery] = React.useState("");
   const [maxPrice, setMaxPrice] = React.useState("400");
   const [showPasses, setShowPasses] = React.useState(false);
@@ -313,6 +322,31 @@ export function ResellerSection(): React.ReactElement {
     }
   }, [closeStream, log]);
 
+  // Craigslist market list for the location dropdown — static server-side
+  // data, fetched once. On failure the dropdown just offers nationwide.
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch(ampyApi.dealFinder.locations)
+      .then((response) => (response.ok ? response.json() : []))
+      .then((data: unknown) => {
+        if (!cancelled && Array.isArray(data)) {
+          setLocations((data as CraigslistLocation[]).filter((item) => item.region === "US" && item.slug && item.state));
+        }
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const marketsByState = React.useMemo(() => {
+    const groups = new Map<string, CraigslistLocation[]>();
+    for (const item of locations) {
+      const group = groups.get(item.state) ?? [];
+      group.push(item);
+      groups.set(item.state, group);
+    }
+    return Array.from(groups.entries());
+  }, [locations]);
+
   const connect = React.useCallback((params: URLSearchParams, silentCache: boolean) => {
     closeStream();
     const source = new EventSource(`${ampyApi.dealFinder.deals}?${params.toString()}`);
@@ -345,15 +379,16 @@ export function ResellerSection(): React.ReactElement {
     setDrawer(null);
     dispatch({ type: "reset", query: target });
     dispatch({ type: "scanning", scanning: true });
-    log(`scan initialized · United States / ${category} / “${target}” · ${deep ? "deep scan (Mistral appraisal)" : "quick scan"}`, "progress", "▸");
-    const params = new URLSearchParams({ location: "us", category, query: target, maxPrice: maxPrice || "400" });
+    const locationLabel = location === "us" ? "United States" : titleCaseLocation(locations.find((item) => item.slug === location)?.name ?? location);
+    log(`scan initialized · ${locationLabel} / ${category} / “${target}” · ${deep ? "deep scan (Mistral appraisal)" : "quick scan"}`, "progress", "▸");
+    const params = new URLSearchParams({ location, category, query: target, maxPrice: maxPrice || "400" });
     if (!deep) params.set("fast", "1");
     if (cached) {
       params.set("cached", "1");
       dispatch({ type: "banner", message: "Showing last real scan · press Find deals for live" });
     }
     connect(params, false);
-  }, [category, connect, deep, log, maxPrice, query]);
+  }, [category, connect, deep, location, locations, log, maxPrice, query]);
 
   // Start clean; the last real scan is one click away via "Last scan".
   React.useEffect(() => closeStream, [closeStream]);
@@ -387,11 +422,18 @@ export function ResellerSection(): React.ReactElement {
         className="grid gap-2 rounded-3xl border border-white/10 bg-[#141418] p-3 shadow-[0_18px_70px_rgba(0,0,0,0.42)] md:grid-cols-[1.1fr_0.9fr_1.7fr_0.7fr_auto]"
         aria-label="Scan settings"
       >
-        <div className="flex h-12 items-center gap-2 rounded-2xl bg-sky-500/15 px-4 text-sm" aria-label="United States, 12 priority markets">
-          <Radar className="size-4 text-sky-300" />
-          <strong className="truncate">United States</strong>
-          <small className="ml-auto font-mono text-[9px] uppercase tracking-[0.1em] text-sky-200/70">12 markets</small>
-        </div>
+        <label className="flex h-12 items-center gap-2 rounded-2xl bg-sky-500/15 px-4 text-sm">
+          <Radar className="size-4 shrink-0 text-sky-300" />
+          <span className="sr-only">Market location</span>
+          <select value={location} onChange={(event) => setLocation(event.target.value)} className="w-full bg-transparent font-semibold text-white outline-none">
+            <option value="us" className="bg-[#141418]">United States · 12 markets</option>
+            {marketsByState.map(([state, markets]) => (
+              <optgroup key={state} label={state} className="bg-[#141418]">
+                {markets.map((item) => <option key={item.slug} value={item.slug} className="bg-[#141418]">{titleCaseLocation(item.name)}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </label>
         <label className="flex h-12 items-center rounded-2xl bg-black/30 px-3 text-sm">
           <span className="sr-only">Listing category</span>
           <select value={category} onChange={(event) => setCategory(event.target.value)} className="w-full bg-transparent text-white outline-none">

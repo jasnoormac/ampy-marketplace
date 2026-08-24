@@ -1,14 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "Ampy — Facebook Marketplace bridge",
-  "version": "0.1.0",
-  "description": "Lets your local Ampy buyer agent search Facebook Marketplace using your own signed-in browser session.",
-  "permissions": ["scripting", "tabs", "storage"],
+  "name": "Ampy bridge",
+  "version": "0.2.0",
+  "description": "Lets your local Ampy agents use your own signed-in browser: Facebook Marketplace search, and pre-filling Craigslist posting forms (you always click publish yourself).",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage"
+  ],
   "host_permissions": [
     "https://www.facebook.com/*",
+    "https://post.craigslist.org/*",
+    "https://*.craigslist.org/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
-  "background": { "service_worker": "background.js", "type": "module" },
-  "action": { "default_popup": "popup.html", "default_title": "Ampy bridge" }
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ampy bridge"
+  }
 }

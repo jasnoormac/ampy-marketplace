@@ -1,14 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { CheckCircle2, ExternalLink, Loader2, Receipt, Rocket, ShoppingBag, Sparkles, X } from "lucide-react";
+import { CheckCircle2, ExternalLink, Loader2, MapPin, Receipt, Rocket, ShoppingBag, Sparkles, X } from "lucide-react";
 
 import { NegotiationChat, isAbort, wait } from "@/components/negotiation-chat";
 import { PromptInputBox } from "@/components/ui/ai-prompt-box";
 import { ampyApi } from "@/lib/ampy";
 import type { Product } from "@/lib/products";
 import { MAX_PURCHASE_ROUNDS, formatUsd, parsePrice, roundPrice, runPurchaseTurn, type PurchaseLine, type PurchaseReceipt } from "@/lib/purchase";
-import { cn } from "@/lib/utils";
+import { cn, titleCaseLocation } from "@/lib/utils";
 
 const NEGOTIATION_MS = 30_000;
 const CHECKOUT_STEPS = [
@@ -42,13 +42,14 @@ interface CraigslistListing {
 }
 
 /** The existing Craigslist scraper in backend/buyer (also folds in items you listed as a seller). */
-async function searchMarketplace(query: string, signal: AbortSignal): Promise<{ message: string; products: Product[] }> {
+async function searchMarketplace(query: string, location: string, signal: AbortSignal): Promise<{ message: string; products: Product[] }> {
   const budget = query.match(/(?:under|max|below)\s*\$?\s*(\d+)/i);
   const cleaned = query.replace(/(?:under|max|below)\s*\$?\s*\d+/i, "").trim() || query;
-  const params = new URLSearchParams({ q: cleaned, limit: "10" });
+  const params = new URLSearchParams({ q: cleaned, limit: "60" });
+  if (location) params.set("location", location);
   if (budget) params.set("maxPrice", budget[1]);
   const response = await fetch(`${ampyApi.buyer.search}?${params.toString()}`, { signal });
-  const payload = await response.json().catch(() => ({})) as { listings?: CraigslistListing[]; source?: string; usedMockData?: boolean; craigslistWarning?: string; error?: string };
+  const payload = await response.json().catch(() => ({})) as { listings?: CraigslistListing[]; total?: number; source?: string; usedMockData?: boolean; craigslistWarning?: string; effectiveQuery?: string; error?: string };
   if (!response.ok) throw new Error(payload.error || "Marketplace search failed. Is the buyer backend running on :3001?");
   const products = (payload.listings || []).flatMap((listing, index): Product[] => {
     if (!listing.title) return [];
@@ -65,12 +66,19 @@ async function searchMarketplace(query: string, signal: AbortSignal): Promise<{ 
   });
   if (!products.length) throw new Error("No listings matched. Try different words.");
   const where = payload.usedMockData ? "demo listings (Craigslist unavailable)" : "Craigslist";
-  return { message: `Found ${products.length} listing${products.length === 1 ? "" : "s"} on ${where}.`, products };
+  const rewritten = payload.effectiveQuery ? ` — searched as “${payload.effectiveQuery}”` : "";
+  const total = typeof payload.total === "number" ? payload.total : products.length;
+  const count = total > products.length
+    ? `Found ${total} listings on ${where} — showing the top ${products.length}`
+    : `Found ${products.length} listing${products.length === 1 ? "" : "s"} on ${where}`;
+  return { message: `${count}${rewritten}.`, products };
 }
 
 /** Buyer: search (existing Craigslist scraper) → pick a product → deploy your buying agent → it negotiates → simulated purchase. */
 export function BuyerSection(): React.ReactElement {
   const [turns, setTurns] = React.useState<Turn[]>([]);
+  const [location, setLocation] = React.useState("");
+  const [locations, setLocations] = React.useState<{ slug: string; name: string; state: string }[]>([]);
   const [isRunning, setIsRunning] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [selected, setSelected] = React.useState<Product | null>(null);
@@ -106,7 +114,7 @@ export function BuyerSection(): React.ReactElement {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      const result = await searchMarketplace(query, controller.signal);
+      const result = await searchMarketplace(query, location, controller.signal);
       setTurns((prev) => [...prev, { id: crypto.randomUUID(), role: "agent", text: `${result.message} Tap one to see it and buy it.`, products: result.products }]);
     } catch (runError: unknown) {
       if (isAbort(runError)) setTurns((prev) => [...prev, { id: crypto.randomUUID(), role: "agent", text: "Stopped." }]);
@@ -115,7 +123,32 @@ export function BuyerSection(): React.ReactElement {
       abortRef.current = null;
       setIsRunning(false);
     }
-  }, [isRunning]);
+  }, [isRunning, location]);
+
+  // Craigslist market list + the server's default region for the location
+  // picker. US-only, like the reseller dropdown.
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch("/api/craigslist-locations")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data: { locations?: { region: string; slug: string; name: string; state: string }[]; default?: string } | null) => {
+        if (cancelled || !data) return;
+        setLocations((data.locations || []).filter((item) => item.region === "US" && item.slug && item.state));
+        if (data.default) setLocation((prev) => prev || data.default!);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const locationsByState = React.useMemo(() => {
+    const groups = new Map<string, { slug: string; name: string; state: string }[]>();
+    for (const item of locations) {
+      const group = groups.get(item.state) ?? [];
+      group.push(item);
+      groups.set(item.state, group);
+    }
+    return Array.from(groups.entries());
+  }, [locations]);
 
   return (
     <section className="mx-auto flex w-full max-w-6xl flex-col gap-8" aria-labelledby="buyer-heading">
@@ -126,7 +159,19 @@ export function BuyerSection(): React.ReactElement {
         </p>
       </header>
 
-      <div className="mx-auto w-full max-w-[720px]">
+      <div className="mx-auto flex w-full max-w-[720px] flex-col gap-2">
+        <label className="flex h-10 items-center gap-2 self-start rounded-full border border-white/10 bg-white/5 px-4 text-xs text-white/70">
+          <MapPin className="size-3.5 shrink-0 text-orange-300" />
+          <span className="sr-only">Craigslist location</span>
+          <select value={location} onChange={(event) => setLocation(event.target.value)} className="bg-transparent pr-1 text-xs font-medium text-white outline-none">
+            {locations.length === 0 ? <option value="" className="bg-[#141418]">loading locations…</option> : null}
+            {locationsByState.map(([state, markets]) => (
+              <optgroup key={state} label={state} className="bg-[#141418]">
+                {markets.map((item) => <option key={item.slug} value={item.slug} className="bg-[#141418]">{titleCaseLocation(item.name)}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </label>
         <PromptInputBox onSend={handleSend} onStop={stop} isLoading={isRunning} showModes={false} placeholder="What do you want to buy?" />
       </div>
 

@@ -22,3 +22,4 @@ frontend/test-results/
 .DS_Store
 *.egg-info/
 .gstack/
+backend/buyer/data/sellerInbox.json

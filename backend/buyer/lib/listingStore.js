@@ -51,13 +51,17 @@ function createListing(fields) {
     location: fields.location || "",
     postedAt: now,
     sellerName: fields.sellerName || null,
+    // Craigslist market slug the seller picked when publishing — drives
+    // the cross-post draft/extension flow (lib/craigslistDraft.js).
+    craigslistLocation: fields.craigslistLocation || undefined,
+    // ZIP the seller ships/sells from — Craigslist's form requires one.
+    postal: fields.postal || undefined,
     sellerRating: null, // no seller review system yet
     description: fields.description || "",
     imageUrl: fields.imageUrl || null,
-    // Only one photo is stored per seller listing today (see /sell —
-    // publishing only uploads the first selected photo). Wrapped in an
-    // array for shape consistency with craigslist listings' `images`.
-    images: fields.imageUrl ? [fields.imageUrl] : [],
+    // All uploaded photos; imageUrl above is the cover (first). Falls
+    // back to wrapping imageUrl for callers that still send just one.
+    images: Array.isArray(fields.images) && fields.images.length ? fields.images : fields.imageUrl ? [fields.imageUrl] : [],
     source: "seller",
     // Optional — the seller's real hidden floor. If set, lib/negotiate.js
     // treats it as ground truth for this listing's negotiations instead of

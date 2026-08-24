@@ -115,7 +115,38 @@ function requestSearch({ query, maxPrice, location, limit = 20 }) {
 }
 
 function publicJob(job) {
-  return { id: job.id, query: job.query, maxPrice: job.maxPrice, location: job.location, limit: job.limit };
+  if (job.type === "craigslist_post") {
+    return { id: job.id, type: "craigslist_post", draft: job.draft };
+  }
+  return { id: job.id, type: "search", query: job.query, maxPrice: job.maxPrice, location: job.location, limit: job.limit };
+}
+
+// How long a queued Craigslist-post job waits for the extension before
+// being dropped. Much longer than search jobs: nothing is awaiting the
+// result — the human finishes the posting in their browser.
+const POST_JOB_EXPIRY_MS = 5 * 60 * 1000;
+
+/**
+ * Queue a "fill the Craigslist posting form" job for the extension.
+ * Fire-and-forget: returns immediately with whether an extension is even
+ * connected; the extension acks via the normal results endpoint purely
+ * for the audit trail.
+ */
+function queueCraigslistPost(draft) {
+  const job = {
+    id: `job_${crypto.randomUUID().slice(0, 12)}`,
+    type: "craigslist_post",
+    draft,
+    createdAt: Date.now(),
+  };
+  job.settle = () => { pendingJobs.delete(job.id); };
+  setTimeout(() => pendingJobs.delete(job.id), POST_JOB_EXPIRY_MS).unref?.();
+  pendingJobs.set(job.id, job);
+
+  const poller = waitingPollers.shift();
+  if (poller) poller([publicJob(job)]);
+
+  return { queued: true, jobId: job.id, extensionConnected: isConnected() };
 }
 
 /**
@@ -151,13 +182,18 @@ function pollForJobs() {
   });
 }
 
-/** The extension delivering scraped listings for a job. */
-function resolveJob(jobId, { listings = [], error } = {}) {
+/** The extension delivering results (scraped listings, or a post-job ack). */
+function resolveJob(jobId, { listings = [], error, status: jobStatus } = {}) {
   lastResultAt = Date.now();
   const job = pendingJobs.get(jobId);
   if (!job) return { ok: false, error: "unknown or already-completed job" };
+  if (job.type === "craigslist_post") {
+    console.log(`[extensionBridge] craigslist post job ${jobId}: ${error || jobStatus || "acknowledged"}`);
+    job.settle();
+    return { ok: !error, status: jobStatus || "acknowledged" };
+  }
   job.settle({ ok: !error, listings, error });
   return { ok: true, accepted: listings.length };
 }
 
-module.exports = { requestSearch, pollForJobs, resolveJob, isConnected, status, JOB_TIMEOUT_MS };
+module.exports = { requestSearch, queueCraigslistPost, pollForJobs, resolveJob, isConnected, status, JOB_TIMEOUT_MS };
