@@ -1,0 +1,14 @@
+.git
+**/node_modules
+**/.next
+**/.venv
+**/.env
+**/.env.*
+**/uploads
+**/*.log
+**/test-results
+**/playwright-report
+seller_scout_agents.egg-info
+**/seller_scout_agents.egg-info
+Dockerfile
+render.yaml

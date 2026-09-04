@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ampyy
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/status
+    envVars:
+      - key: MISTRAL_API_KEY
+        sync: false # secret — set in the Render dashboard, never committed
+      - key: MISTRAL_MODEL
+        value: mistral-medium-latest
+      - key: MISTRAL_SEARCH_TOOL
+        value: web_search
+      - key: USE_MOCK_DATA
+        value: "false"
+      - key: CRAIGSLIST_LOCATION
+        value: sfbay
